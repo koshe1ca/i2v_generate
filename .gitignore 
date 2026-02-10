@@ -1,0 +1,19 @@
+# venv / python
+.venv/
+__pycache__/
+*.pyc
+
+# caches
+.cache/
+.hf_cache/
+*.safetensors
+*.ckpt
+*.bin
+
+# outputs
+outputs/
+*.mp4
+*.gif
+
+# env
+.env

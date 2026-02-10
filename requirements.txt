@@ -1,0 +1,24 @@
+# Core
+numpy>=1.26
+pillow>=10.0
+tqdm>=4.66
+
+# Hugging Face / Diffusers stack
+transformers>=4.41
+accelerate>=0.33
+safetensors>=0.4
+huggingface_hub>=0.24
+diffusers>=0.30
+
+# Video export (mp4)
+imageio>=2.34
+imageio-ffmpeg>=0.5
+
+# Config / CLI
+pydantic>=2.7
+python-dotenv>=1.0
+typer>=0.12
+rich>=13.7
+
+# Optional but useful (downloading via https/requests)
+requests>=2.32
