@@ -1,0 +1,18 @@
+# weights / models
+checkpoints/
+animatediff_models/
+models/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.bin
+
+# venv + cache
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# IDE
+.idea/
