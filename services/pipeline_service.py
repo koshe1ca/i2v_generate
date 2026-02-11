@@ -42,7 +42,7 @@ class EngineConfig:
     ad_seed: int = 42
 
     # ---- SVD (Image2Video) ----
-    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid"  # легче чем xt
+    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid"
     svd_num_frames: int = 14
     svd_num_steps: int = 35
 
@@ -60,6 +60,16 @@ class EngineConfig:
 
     # ---- Video ----
     fps: int = 24
+
+    svd_num_frames: int = 48  # 2 секунды при 24 fps
+    svd_num_steps: int = 30  # качество ↑, время ↑
+    svd_motion_bucket_id: int = 50  # умеренное движение (лицо меньше плывёт)
+    svd_noise_aug_strength: float = 0.0
+
+    svd_min_guidance: float = 1.5
+    svd_max_guidance: float = 3.5
+    mp4_crf: int = 16
+    save_frames: bool = True
     mp4_crf: int = 16  # лучше качество (файл больше)
 
     # ---- Frames export ----
