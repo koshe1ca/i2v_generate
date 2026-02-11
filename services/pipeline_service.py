@@ -30,11 +30,11 @@ class EngineConfig:
     output_dir: str = "outputs"
 
     # ---- Device ----
-    device: str = "auto"          # auto | mps | cuda | cpu
-    torch_dtype: str = "auto"     # auto | float16 | bfloat16 | float32
+    device: str = "auto"
+    torch_dtype: str = "auto"
 
     # ---- AnimateDiff (Text2Video) ----
-    ad_base_model_id: str = "SG161222/Realistic_Vision_V5.1_noVAE"  # SD1.5 realistic checkpoint on HF
+    ad_base_model_id: str = "SG161222/Realistic_Vision_V5.1_noVAE"
     ad_motion_adapter_id: str = "guoyww/animatediff-motion-adapter-v1-5"
     ad_num_frames: int = 8
     ad_num_steps: int = 10
@@ -42,16 +42,28 @@ class EngineConfig:
     ad_seed: int = 42
 
     # ---- SVD (Image2Video) ----
-    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid-xt"
-    svd_num_frames: int = 25
-    svd_num_steps: int = 25
-    svd_motion_bucket_id: int = 127
-    svd_noise_aug_strength: float = 0.02
+    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid"  # легче чем xt
+    svd_num_frames: int = 14
+    svd_num_steps: int = 35
+
+    # меньше движения = меньше "плывёт" лицо
+    svd_motion_bucket_id: int = 50
+
+    # 0.0–0.01 лучше держит лицо
+    svd_noise_aug_strength: float = 0.0
+
+    # guidance в SVD есть, и он влияет на детали/стабильность
+    svd_min_guidance: float = 1.5
+    svd_max_guidance: float = 3.5
+
     svd_seed: int = 42
 
     # ---- Video ----
     fps: int = 24
-    mp4_crf: int = 19  # quality: 18-23 is typical
+    mp4_crf: int = 16  # лучше качество (файл больше)
+
+    # ---- Frames export ----
+    save_frames: bool = True
 
 
 class PipelineService:
@@ -77,15 +89,15 @@ class PipelineService:
     # ----------------------------
 
     def generate_text2video_ad(
-        self,
-        prompt: str,
-        negative_prompt: str = "bad quality, worst quality",
-        num_frames: Optional[int] = None,
-        width: int = 512,
-        height: int = 512,
-        fps: Optional[int] = None,
-        seed: Optional[int] = None,
-        out_name: Optional[str] = None,
+            self,
+            prompt: str,
+            negative_prompt: str = "bad quality, worst quality",
+            num_frames: Optional[int] = None,
+            width: int = 512,
+            height: int = 512,
+            fps: Optional[int] = None,
+            seed: Optional[int] = None,
+            out_name: Optional[str] = None,
     ) -> Path:
         """
         AnimateDiff (SD1.5) Text -> Video (mp4)
@@ -101,7 +113,6 @@ class PipelineService:
         console.print("[cyan]Running AnimateDiff Text→Video...[/cyan]")
         t0 = time.time()
 
-        # Many SD1.5 models expect 512-ish sizes; keep it for realism/stability
         out = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -113,32 +124,32 @@ class PipelineService:
             height=int(height),
         )
 
-        frames = out.frames[0]  # list[PIL.Image]
+        frames = out.frames[0]
         mp4_path = self._export_mp4(frames, fps=fps, out_name=out_name or "ad_text2video")
 
         console.print(f"[green]Done[/green] in {time.time() - t0:.1f}s → {mp4_path}")
         return mp4_path
 
     def generate_image2video_svd(
-        self,
-        image: Union[str, Path, Image.Image],
-        fps: Optional[int] = None,
-        seed: Optional[int] = None,
-        out_name: Optional[str] = None,
-        resize_to: Tuple[int, int] = (1024, 576),
+            self,
+            image: Union[str, Path, Image.Image],
+            fps: Optional[int] = None,
+            seed: Optional[int] = None,
+            out_name: Optional[str] = None,
+            resize_to: Tuple[int, int] = (1024, 576),
     ) -> Path:
         """
         Stable Video Diffusion (SVD) Image -> Video (mp4)
-        Best for "one image -> realistic motion" baseline.
         """
         pipe = self._get_svd_pipe()
 
         fps = fps if fps is not None else self.cfg.fps
         seed = seed if seed is not None else self.cfg.svd_seed
 
+        # 👉 вот здесь создаётся init_img
         init_img = self._load_image(image)
         init_img = init_img.convert("RGB")
-        init_img = init_img.resize(resize_to, Image.LANCZOS)
+        init_img = self._fit_center_crop(init_img, resize_to)
 
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
 
@@ -152,10 +163,15 @@ class PipelineService:
             generator=generator,
             motion_bucket_id=int(self.cfg.svd_motion_bucket_id),
             noise_aug_strength=float(self.cfg.svd_noise_aug_strength),
+            min_guidance_scale=float(self.cfg.svd_min_guidance),
+            max_guidance_scale=float(self.cfg.svd_max_guidance),
         )
 
-        # out.frames can be list of PIL or numpy depending on version; normalize:
         frames = self._normalize_frames(out.frames[0])
+
+        if getattr(self.cfg, "save_frames", False):
+            self._export_frames_png(frames, out_name=out_name or "svd_img2video")
+
         mp4_path = self._export_mp4(frames, fps=fps, out_name=out_name or "svd_img2video")
 
         console.print(f"[green]Done[/green] in {time.time() - t0:.1f}s → {mp4_path}")
@@ -191,6 +207,17 @@ class PipelineService:
         self._configure_pipe(pipe)
         self._ad_pipe = pipe
         return pipe
+
+    def _export_frames_png(self, frames: List[Image.Image], out_name: str) -> Path:
+        out_dir = Path(self.cfg.output_dir) / "frames" / f"{out_name}_{int(time.time())}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, fr in enumerate(frames):
+            fr = fr.convert("RGB")
+            fr.save(out_dir / f"{i:04d}.png", compress_level=3)
+
+        console.print(f"[green]Saved frames:[/green] {out_dir}")
+        return out_dir
 
     def _get_svd_pipe(self) -> StableVideoDiffusionPipeline:
         if self._svd_pipe is not None:
@@ -243,7 +270,11 @@ class PipelineService:
             codec="libx264",
             quality=None,
             pixelformat="yuv420p",
-            ffmpeg_params=["-crf", str(int(self.cfg.mp4_crf))],
+            ffmpeg_params=[
+                "-crf", str(int(self.cfg.mp4_crf)),
+                "-preset", "slow",
+                "-movflags", "+faststart",
+            ]
         )
         try:
             for fr in np_frames:
@@ -252,6 +283,31 @@ class PipelineService:
             writer.close()
 
         return out_path
+
+    def _fit_center_crop(self, img: Image.Image, size: Tuple[int, int]) -> Image.Image:
+        target_w, target_h = size
+        img = img.convert("RGB")
+
+        src_w, src_h = img.size
+        src_ratio = src_w / src_h
+        tgt_ratio = target_w / target_h
+
+        # сначала масштабируем так, чтобы перекрыть нужную область
+        if src_ratio > tgt_ratio:
+            # исходник шире — подгоняем по высоте
+            new_h = target_h
+            new_w = int(new_h * src_ratio)
+        else:
+            # исходник выше — подгоняем по ширине
+            new_w = target_w
+            new_h = int(new_w / src_ratio)
+
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        left = (new_w - target_w) // 2
+        top = (new_h - target_h) // 2
+        return img.crop((left, top, left + target_w, top + target_h))
+
 
     def _normalize_frames(self, frames) -> List[Image.Image]:
         # frames might be list[np.ndarray] or list[PIL.Image]
