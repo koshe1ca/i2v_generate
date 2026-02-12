@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import cv2
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,10 @@ class EngineConfig:
     svd_min_guidance: float = 1.5
     svd_max_guidance: float = 3.5
     svd_seed: int = 42
+    # ---- IP-Adapter FaceID (for stable face) ----
+    faceid_repo: str = "h94/IP-Adapter-FaceID"
+    faceid_weight: str = "ip-adapter-faceid_sd15.bin"
+    faceid_scale: float = 0.65  # 0.5–0.8 обычно норм
 
     # ---- Video ----
     fps: int = 24
@@ -77,6 +82,18 @@ class PipelineService:
 
         console.print(f"[green]Device:[/green] {self._device}")
         console.print(f"[green]Dtype:[/green] {self._dtype}")
+
+    def _load_faceid_embeds(self, emb_path: Union[str, Path]) -> torch.Tensor:
+        emb = np.load(str(emb_path))  # shape (512,)
+        emb = torch.from_numpy(emb).float().unsqueeze(0)  # (1,512)
+
+        # (1,1,1,512) как в доках diffusers
+        ref = emb.unsqueeze(0).unsqueeze(0)
+        neg = torch.zeros_like(ref)
+
+        id_embeds = torch.cat([neg, ref], dim=0)  # (2,1,1,512)
+        id_embeds = id_embeds.to(device=self._device, dtype=self._dtype)
+        return id_embeds
 
     # ----------------------------
     # Public API
@@ -179,12 +196,23 @@ class PipelineService:
         console.print("[yellow]Loading AnimateDiff pipelines...[/yellow]")
         adapter = MotionAdapter.from_pretrained(self.cfg.ad_motion_adapter_id, torch_dtype=self._dtype)
 
+
+
         pipe = AnimateDiffPipeline.from_pretrained(
             self.cfg.ad_base_model_id,
             motion_adapter=adapter,
             torch_dtype=self._dtype,
             safety_checker=None,  # local, faster (you can remove if you want)
         )
+
+        # IP-Adapter FaceID (держит лицо)
+        pipe.load_ip_adapter(
+            self.cfg.faceid_repo,
+            subfolder=None,
+            weight_name=self.cfg.faceid_weight,
+            image_encoder_folder=None,
+        )
+        pipe.set_ip_adapter_scale(self.cfg.faceid_scale)
 
         # Scheduler: important recommendation for AnimateDiff
         pipe.scheduler = DDIMScheduler.from_pretrained(
