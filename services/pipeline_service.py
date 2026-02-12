@@ -25,7 +25,6 @@ console = Console()
 
 
 @dataclass(frozen=True)
-@dataclass(frozen=True)
 class EngineConfig:
     # ---- Output ----
     output_dir: str = "outputs"
