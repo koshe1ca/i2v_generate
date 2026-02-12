@@ -44,9 +44,9 @@ class EngineConfig:
 
     # ---- SVD (Image2Video) ----
     svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid"
-    svd_num_frames: int = 48          # 2 секунды при 24 fps
-    svd_num_steps: int = 30           # качество ↑, время ↑
-    svd_motion_bucket_id: int = 50    # умеренное движение
+    svd_num_frames: int = 12
+    svd_num_steps: int = 25           # качество ↑, время ↑
+    svd_motion_bucket_id: int = 40    # умеренное движение
     svd_noise_aug_strength: float = 0.0
 
     svd_min_guidance: float = 1.5
@@ -55,7 +55,7 @@ class EngineConfig:
 
     # ---- Video ----
     fps: int = 24
-    mp4_crf: int = 16                 # качество лучше (файл больше)
+    mp4_crf: int = 18
 
     # ---- Frames export ----
     save_frames: bool = True
@@ -94,9 +94,7 @@ class PipelineService:
             seed: Optional[int] = None,
             out_name: Optional[str] = None,
     ) -> Path:
-        """
-        AnimateDiff (SD1.5) Text -> Video (mp4)
-        """
+
         pipe = self._get_ad_pipe()
 
         n_frames = num_frames if num_frames is not None else self.cfg.ad_num_frames
@@ -131,7 +129,7 @@ class PipelineService:
             fps: Optional[int] = None,
             seed: Optional[int] = None,
             out_name: Optional[str] = None,
-            resize_to: Tuple[int, int] = (1024, 576),
+            resize_to: Tuple[int, int] = (512, 512),
     ) -> Path:
         """
         Stable Video Diffusion (SVD) Image -> Video (mp4)
@@ -141,7 +139,6 @@ class PipelineService:
         fps = fps if fps is not None else self.cfg.fps
         seed = seed if seed is not None else self.cfg.svd_seed
 
-        # 👉 вот здесь создаётся init_img
         init_img = self._load_image(image)
         init_img = init_img.convert("RGB")
         init_img = self._fit_center_crop(init_img, resize_to)
