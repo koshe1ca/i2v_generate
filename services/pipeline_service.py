@@ -1,373 +1,126 @@
-from __future__ import annotations
-
-import os
-import cv2
-import time
-from dataclasses import dataclass
+# services/pipeline_service.py
+import json
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional
 
-import numpy as np
 import torch
 from PIL import Image
-from rich.console import Console
+from diffusers import AnimateDiffPipeline, MotionAdapter, ControlNetModel, DDIMScheduler
 
-import imageio
-
-# Diffusers
-from diffusers import (
-    MotionAdapter,
-    AnimateDiffPipeline,
-    DDIMScheduler,
-    StableVideoDiffusionPipeline,
-)
-
-console = Console()
-
-
-@dataclass(frozen=True)
-class EngineConfig:
-    # ---- Output ----
-    output_dir: str = "outputs"
-
-    # ---- Device ----
-    device: str = "auto"
-    torch_dtype: str = "auto"
-
-    # ---- AnimateDiff (Text2Video) ----
-    ad_base_model_id: str = "SG161222/Realistic_Vision_V5.1_noVAE"
-    ad_motion_adapter_id: str = "guoyww/animatediff-motion-adapter-v1-5"
-    ad_num_frames: int = 8
-    ad_num_steps: int = 10
-    ad_guidance: float = 7.5
-    ad_seed: int = 42
-
-    # ---- SVD (Image2Video) ----
-    svd_model_id: str = "stabilityai/stable-video-diffusion-img2vid"
-    svd_num_frames: int = 12
-    svd_num_steps: int = 25           # качество ↑, время ↑
-    svd_motion_bucket_id: int = 40    # умеренное движение
-    svd_noise_aug_strength: float = 0.0
-
-    svd_min_guidance: float = 1.5
-    svd_max_guidance: float = 3.5
-    svd_seed: int = 42
-    # ---- IP-Adapter FaceID (for stable face) ----
-    faceid_repo: str = "h94/IP-Adapter-FaceID"
-    faceid_weight: str = "ip-adapter-faceid_sd15.bin"
-    faceid_scale: float = 0.65  # 0.5–0.8 обычно норм
-
-    # ---- Video ----
-    fps: int = 24
-    mp4_crf: int = 18
-
-    # ---- Frames export ----
-    save_frames: bool = True
+from models.settings import EngineSettings
+from models.history import HistoryDB, HistoryItem
+from services.video_service import VideoService
+from services.temporal_service import TemporalService
+from services.face_restore_service import FaceRestoreService
 
 
 class PipelineService:
-    """
-    Service layer: loads pipelines once, runs generation, exports mp4.
-    """
+    def __init__(self, settings: EngineSettings):
+        self.s = settings
+        self.pipe: Optional[AnimateDiffPipeline] = None
+        self.video = VideoService(self.s.output_dir, mp4_crf=self.s.video.mp4_crf)
+        self.temporal = TemporalService()
+        self.face_restore = FaceRestoreService()
 
-    def __init__(self, cfg: EngineConfig):
-        self.cfg = cfg
-        self._device = self._resolve_device(cfg.device)
-        self._dtype = self._resolve_dtype(cfg.torch_dtype, self._device)
+        Path(self.s.output_dir).mkdir(parents=True, exist_ok=True)
 
-        self._ad_pipe: Optional[AnimateDiffPipeline] = None
-        self._svd_pipe: Optional[StableVideoDiffusionPipeline] = None
+    def load(self):
+        adapter = MotionAdapter.from_pretrained(self.s.motion_adapter, torch_dtype=torch.float16)
 
-        Path(self.cfg.output_dir).mkdir(parents=True, exist_ok=True)
+        controlnet = None
+        if self.s.controlnet.enable:
+            controlnet = ControlNetModel.from_pretrained(self.s.controlnet.model_id, torch_dtype=torch.float16)
 
-        console.print(f"[green]Device:[/green] {self._device}")
-        console.print(f"[green]Dtype:[/green] {self._dtype}")
+        self.pipe = AnimateDiffPipeline.from_pretrained(
+            self.s.base_model,
+            motion_adapter=adapter,
+            controlnet=controlnet,
+            torch_dtype=torch.float16,
+            safety_checker=None,
+        )
+        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.to(self.s.device)
 
-    def _load_faceid_embeds(self, emb_path: Union[str, Path]) -> torch.Tensor:
-        emb = np.load(str(emb_path))  # shape (512,)
-        emb = torch.from_numpy(emb).float().unsqueeze(0)  # (1,512)
+        # LoRA stack
+        for item in self.s.lora.items:
+            self.pipe.load_lora_weights(item.path)
+            self.pipe.fuse_lora(lora_scale=float(item.scale))
 
-        # (1,1,1,512) как в доках diffusers
-        ref = emb.unsqueeze(0).unsqueeze(0)
-        neg = torch.zeros_like(ref)
+    def _load_pose_images(self, pose_dir: str) -> List[Image.Image]:
+        p = Path(pose_dir)
+        imgs = [Image.open(x).convert("RGB") for x in sorted(p.glob("*.png"))]
+        return imgs
 
-        id_embeds = torch.cat([neg, ref], dim=0)  # (2,1,1,512)
-        id_embeds = id_embeds.to(device=self._device, dtype=self._dtype)
-        return id_embeds
+    def generate_ad(self, pose_dir: Optional[str] = None) -> Path:
+        if self.pipe is None:
+            raise RuntimeError("Pipeline not loaded. Call load() first.")
 
-    # ----------------------------
-    # Public API
-    # ----------------------------
+        control_images = None
+        mode = "ad"
+        if pose_dir:
+            control_images = self._load_pose_images(pose_dir)
+            mode = "ad_pose"
 
-    def generate_text2video_ad(
-            self,
-            prompt: str,
-            negative_prompt: str = "bad quality, worst quality",
-            num_frames: Optional[int] = None,
-            width: int = 512,
-            height: int = 512,
-            fps: Optional[int] = None,
-            seed: Optional[int] = None,
-            out_name: Optional[str] = None,
-    ) -> Path:
-
-        pipe = self._get_ad_pipe()
-
-        n_frames = num_frames if num_frames is not None else self.cfg.ad_num_frames
-        fps = fps if fps is not None else self.cfg.fps
-        seed = seed if seed is not None else self.cfg.ad_seed
-
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-
-        console.print("[cyan]Running AnimateDiff Text→Video...[/cyan]")
-        t0 = time.time()
-
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_frames=int(n_frames),
-            guidance_scale=float(self.cfg.ad_guidance),
-            num_inference_steps=int(self.cfg.ad_num_steps),
-            generator=generator,
-            width=int(width),
-            height=int(height),
+        out = self.pipe(
+            prompt=self.s.prompt,
+            negative_prompt=self.s.negative_prompt,
+            num_frames=self.s.video.num_frames,
+            num_inference_steps=self.s.video.steps,
+            guidance_scale=self.s.video.guidance,
+            width=self.s.video.width,
+            height=self.s.video.height,
+            control_image=control_images,
+            controlnet_conditioning_scale=float(self.s.controlnet.conditioning_scale),
         )
 
         frames = out.frames[0]
-        mp4_path = self._export_mp4(frames, fps=fps, out_name=out_name or "ad_text2video")
 
-        console.print(f"[green]Done[/green] in {time.time() - t0:.1f}s → {mp4_path}")
-        return mp4_path
-
-    def generate_image2video_svd(
-            self,
-            image: Union[str, Path, Image.Image],
-            fps: Optional[int] = None,
-            seed: Optional[int] = None,
-            out_name: Optional[str] = None,
-            resize_to: Tuple[int, int] = (512, 512),
-    ) -> Path:
-        """
-        Stable Video Diffusion (SVD) Image -> Video (mp4)
-        """
-        pipe = self._get_svd_pipe()
-
-        fps = fps if fps is not None else self.cfg.fps
-        seed = seed if seed is not None else self.cfg.svd_seed
-
-        init_img = self._load_image(image)
-        init_img = init_img.convert("RGB")
-        init_img = self._fit_center_crop(init_img, resize_to)
-
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-
-        console.print("[cyan]Running SVD Image→Video...[/cyan]")
-        t0 = time.time()
-
-        out = pipe(
-            image=init_img,
-            num_frames=int(self.cfg.svd_num_frames),
-            num_inference_steps=int(self.cfg.svd_num_steps),
-            generator=generator,
-            motion_bucket_id=int(self.cfg.svd_motion_bucket_id),
-            noise_aug_strength=float(self.cfg.svd_noise_aug_strength),
-            min_guidance_scale=float(self.cfg.svd_min_guidance),
-            max_guidance_scale=float(self.cfg.svd_max_guidance),
-        )
-
-        frames = self._normalize_frames(out.frames[0])
-
-        if getattr(self.cfg, "save_frames", False):
-            self._export_frames_png(frames, out_name=out_name or "svd_img2video")
-
-        mp4_path = self._export_mp4(frames, fps=fps, out_name=out_name or "svd_img2video")
-
-        console.print(f"[green]Done[/green] in {time.time() - t0:.1f}s → {mp4_path}")
-        return mp4_path
-
-    # ----------------------------
-    # Pipeline loaders (lazy)
-    # ----------------------------
-
-    def _get_ad_pipe(self) -> AnimateDiffPipeline:
-        if self._ad_pipe is not None:
-            return self._ad_pipe
-
-        console.print("[yellow]Loading AnimateDiff pipelines...[/yellow]")
-        adapter = MotionAdapter.from_pretrained(self.cfg.ad_motion_adapter_id, torch_dtype=self._dtype)
-
-
-
-        pipe = AnimateDiffPipeline.from_pretrained(
-            self.cfg.ad_base_model_id,
-            motion_adapter=adapter,
-            torch_dtype=self._dtype,
-            safety_checker=None,  # local, faster (you can remove if you want)
-        )
-
-        # IP-Adapter FaceID (держит лицо)
-        pipe.load_ip_adapter(
-            self.cfg.faceid_repo,
-            subfolder=None,
-            weight_name=self.cfg.faceid_weight,
-            image_encoder_folder=None,
-        )
-        pipe.set_ip_adapter_scale(self.cfg.faceid_scale)
-
-        # Scheduler: important recommendation for AnimateDiff
-        pipe.scheduler = DDIMScheduler.from_pretrained(
-            self.cfg.ad_base_model_id,
-            subfolder="scheduler",
-            clip_sample=False,
-            timestep_spacing="linspace",
-            steps_offset=1,
-        )
-
-        self._configure_pipe(pipe)
-        self._ad_pipe = pipe
-        return pipe
-
-    def _export_frames_png(self, frames: List[Image.Image], out_name: str) -> Path:
-        out_dir = Path(self.cfg.output_dir) / "frames" / f"{out_name}_{int(time.time())}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        for i, fr in enumerate(frames):
-            fr = fr.convert("RGB")
-            fr.save(out_dir / f"{i:04d}.png", compress_level=3)
-
-        console.print(f"[green]Saved frames:[/green] {out_dir}")
-        return out_dir
-
-    def _get_svd_pipe(self) -> StableVideoDiffusionPipeline:
-        if self._svd_pipe is not None:
-            return self._svd_pipe
-
-        console.print("[yellow]Loading SVD pipeline...[/yellow]")
-        pipe = StableVideoDiffusionPipeline.from_pretrained(
-            self.cfg.svd_model_id,
-            torch_dtype=self._dtype,
-            safety_checker=None,
-        )
-
-        self._configure_pipe(pipe)
-        self._svd_pipe = pipe
-        return pipe
-
-    # ----------------------------
-    # Helpers
-    # ----------------------------
-
-    def _configure_pipe(self, pipe):
-        # Memory savers (important on MPS too)
-        try:
-            pipe.enable_vae_slicing()
-        except Exception:
-            pass
-
-        try:
-            pipe.enable_attention_slicing()
-        except Exception:
-            pass
-
-        # Move to device
-        if self._device in ("cuda", "mps"):
-            pipe.to(self._device)
-        else:
-            pipe.to("cpu")
-
-    def _export_mp4(self, frames: List[Image.Image], fps: int, out_name: str) -> Path:
-        out_dir = Path(self.cfg.output_dir)
-        out_path = out_dir / f"{out_name}_{int(time.time())}.mp4"
-
-        # Convert PIL -> uint8 np arrays
-        np_frames = [np.array(f.convert("RGB"), dtype=np.uint8) for f in frames]
-
-        # Write MP4 with ffmpeg backend
-        writer = imageio.get_writer(
-            out_path,
-            fps=int(fps),
-            codec="libx264",
-            quality=None,
-            pixelformat="yuv420p",
-            ffmpeg_params=[
-                "-crf", str(int(self.cfg.mp4_crf)),
-                "-preset", "slow",
-                "-movflags", "+faststart",
-            ]
-        )
-        try:
-            for fr in np_frames:
-                writer.append_data(fr)
-        finally:
-            writer.close()
-
-        return out_path
-
-    def _fit_center_crop(self, img: Image.Image, size: Tuple[int, int]) -> Image.Image:
-        target_w, target_h = size
-        img = img.convert("RGB")
-
-        src_w, src_h = img.size
-        src_ratio = src_w / src_h
-        tgt_ratio = target_w / target_h
-
-        # сначала масштабируем так, чтобы перекрыть нужную область
-        if src_ratio > tgt_ratio:
-            # исходник шире — подгоняем по высоте
-            new_h = target_h
-            new_w = int(new_h * src_ratio)
-        else:
-            # исходник выше — подгоняем по ширине
-            new_w = target_w
-            new_h = int(new_w / src_ratio)
-
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-
-        left = (new_w - target_w) // 2
-        top = (new_h - target_h) // 2
-        return img.crop((left, top, left + target_w, top + target_h))
-
-
-    def _normalize_frames(self, frames) -> List[Image.Image]:
-        # frames might be list[np.ndarray] or list[PIL.Image]
-        normalized: List[Image.Image] = []
-        for f in frames:
-            if isinstance(f, Image.Image):
-                normalized.append(f)
+        # --- Temporal consistency ---
+        if self.s.temporal.enable:
+            if self.s.temporal.face_lock_only:
+                frames = self.temporal.apply_face_lock(frames, strength=self.s.temporal.strength)
             else:
-                normalized.append(Image.fromarray(np.asarray(f).astype(np.uint8)))
-        return normalized
+                frames = self.temporal.apply_global_temporal(frames, strength=self.s.temporal.strength)
 
-    def _load_image(self, image: Union[str, Path, Image.Image]) -> Image.Image:
-        if isinstance(image, Image.Image):
-            return image
-        p = Path(image)
-        if not p.exists():
-            raise FileNotFoundError(f"Image not found: {p}")
-        return Image.open(p)
+        # --- Face restore ---
+        if self.s.face_restore.enable:
+            frames = self.face_restore.restore(
+                frames,
+                method=self.s.face_restore.method,
+                strength=self.s.face_restore.strength,
+            )
 
-    def _resolve_device(self, device: str) -> str:
-        device = (device or "auto").lower()
-        if device != "auto":
-            return device
+        # save
+        frames_dir = None
+        if self.s.video.save_frames:
+            frames_dir = self.video.save_frames(frames, tag=mode)
 
-        if torch.cuda.is_available():
-            return "cuda"
-        # MPS available?
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+        mp4 = self.video.export_mp4(frames, fps=self.s.video.fps, tag=mode)
 
-    def _resolve_dtype(self, dtype: str, device: str):
-        dtype = (dtype or "auto").lower()
-        if dtype == "float16":
-            return torch.float16
-        if dtype == "bfloat16":
-            return torch.bfloat16
-        if dtype == "float32":
-            return torch.float32
+        # history
+        self._append_history(
+            HistoryItem(
+                created_at=HistoryDB.now_iso(),
+                mode=mode,
+                prompt=self.s.prompt,
+                negative_prompt=self.s.negative_prompt,
+                input_image=self.s.input_image,
+                ref_video=self.s.ref_video,
+                pose_dir=pose_dir,
+                output_video=str(mp4),
+                output_frames_dir=str(frames_dir) if frames_dir else None,
+                settings=self.s.model_dump(),
+            )
+        )
 
-        # auto
-        if device in ("cuda", "mps"):
-            return torch.float16
-        return torch.float32
+        return mp4
+
+    def _append_history(self, item: HistoryItem):
+        path = Path(self.s.output_dir) / "history.json"
+        if path.exists():
+            db = HistoryDB(**json.loads(path.read_text(encoding="utf-8")))
+        else:
+            db = HistoryDB()
+
+        db.items.insert(0, item)
+        path.write_text(db.model_dump_json(indent=2), encoding="utf-8")
