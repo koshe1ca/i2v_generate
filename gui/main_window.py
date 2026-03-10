@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -23,15 +23,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QPlainTextEdit,
-    QScrollArea,
     QSpinBox,
-    QDoubleSpinBox,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import QUrl
 
 from controllers.generate_controller import GenerateController
 from models.history import HistoryItem
@@ -106,9 +103,9 @@ class MainWindow(QMainWindow):
         self.output_dir_edit = QLineEdit(); self.output_dir_btn = QPushButton("Browse")
         self.preset_box = QComboBox(); self.preset_box.addItems(["fast", "balanced", "high"])
 
-        row_img = QWidget(); row_img_l = QHBoxLayout(row_img); row_img_l.setContentsMargins(0,0,0,0); row_img_l.addWidget(self.input_image_edit); row_img_l.addWidget(self.input_image_btn)
-        row_vid = QWidget(); row_vid_l = QHBoxLayout(row_vid); row_vid_l.setContentsMargins(0,0,0,0); row_vid_l.addWidget(self.ref_video_edit); row_vid_l.addWidget(self.ref_video_btn)
-        row_out = QWidget(); row_out_l = QHBoxLayout(row_out); row_out_l.setContentsMargins(0,0,0,0); row_out_l.addWidget(self.output_dir_edit); row_out_l.addWidget(self.output_dir_btn)
+        row_img = QWidget(); row_img_l = QHBoxLayout(row_img); row_img_l.setContentsMargins(0, 0, 0, 0); row_img_l.addWidget(self.input_image_edit); row_img_l.addWidget(self.input_image_btn)
+        row_vid = QWidget(); row_vid_l = QHBoxLayout(row_vid); row_vid_l.setContentsMargins(0, 0, 0, 0); row_vid_l.addWidget(self.ref_video_edit); row_vid_l.addWidget(self.ref_video_btn)
+        row_out = QWidget(); row_out_l = QHBoxLayout(row_out); row_out_l.setContentsMargins(0, 0, 0, 0); row_out_l.addWidget(self.output_dir_edit); row_out_l.addWidget(self.output_dir_btn)
 
         form.addRow("Mode", self.mode_box)
         form.addRow("Quality preset", self.preset_box)
@@ -122,7 +119,7 @@ class MainWindow(QMainWindow):
 
         adv = QGroupBox("Advanced settings")
         adv_form = QFormLayout(adv)
-        self.frames_spin = QSpinBox(); self.frames_spin.setRange(4, 128)
+        self.frames_spin = QSpinBox(); self.frames_spin.setRange(4, 256)
         self.steps_spin = QSpinBox(); self.steps_spin.setRange(1, 200)
         self.guidance_spin = QDoubleSpinBox(); self.guidance_spin.setRange(0.0, 20.0); self.guidance_spin.setSingleStep(0.1)
         self.width_spin = QSpinBox(); self.width_spin.setRange(256, 2048); self.width_spin.setSingleStep(64)
@@ -136,14 +133,21 @@ class MainWindow(QMainWindow):
         self.face_lock_cb = QCheckBox("Face lock only")
         self.temporal_strength = QDoubleSpinBox(); self.temporal_strength.setRange(0, 1); self.temporal_strength.setSingleStep(0.05)
         self.control_strength = QDoubleSpinBox(); self.control_strength.setRange(0, 2); self.control_strength.setSingleStep(0.05)
+        self.ip_adapter_scale = QDoubleSpinBox(); self.ip_adapter_scale.setRange(0, 2); self.ip_adapter_scale.setSingleStep(0.05)
+        self.long_video_cb = QCheckBox("Long video mode")
+        self.target_duration_spin = QDoubleSpinBox(); self.target_duration_spin.setRange(1, 60); self.target_duration_spin.setSingleStep(1)
+        self.chunk_frames_spin = QSpinBox(); self.chunk_frames_spin.setRange(4, 64)
+        self.overlap_frames_spin = QSpinBox(); self.overlap_frames_spin.setRange(0, 32)
+        self.target_fps_after_rife_spin = QSpinBox(); self.target_fps_after_rife_spin.setRange(1, 120)
 
-        adv_form.addRow("Frames", self.frames_spin)
+        adv_form.addRow("Frames / chunk", self.frames_spin)
         adv_form.addRow("Steps", self.steps_spin)
         adv_form.addRow("Guidance", self.guidance_spin)
         adv_form.addRow("Width", self.width_spin)
         adv_form.addRow("Height", self.height_spin)
         adv_form.addRow("FPS", self.fps_spin)
         adv_form.addRow("Seed", self.seed_spin)
+        adv_form.addRow("IP-Adapter scale", self.ip_adapter_scale)
         adv_form.addRow(self.temporal_cb)
         adv_form.addRow(self.face_lock_cb)
         adv_form.addRow("Temporal strength", self.temporal_strength)
@@ -151,6 +155,11 @@ class MainWindow(QMainWindow):
         adv_form.addRow(self.controlnet_cb)
         adv_form.addRow("Control strength", self.control_strength)
         adv_form.addRow(self.save_frames_cb)
+        adv_form.addRow(self.long_video_cb)
+        adv_form.addRow("Target duration (sec)", self.target_duration_spin)
+        adv_form.addRow("Chunk frames", self.chunk_frames_spin)
+        adv_form.addRow("Overlap frames", self.overlap_frames_spin)
+        adv_form.addRow("Target FPS after RIFE", self.target_fps_after_rife_spin)
 
         left_layout.addLayout(form)
         left_layout.addWidget(adv)
@@ -263,6 +272,7 @@ class MainWindow(QMainWindow):
         self.height_spin.setValue(s.video.height)
         self.fps_spin.setValue(s.video.fps)
         self.seed_spin.setValue(s.video.seed)
+        self.ip_adapter_scale.setValue(s.ip_adapter.scale)
         self.temporal_cb.setChecked(s.temporal.enable)
         self.face_restore_cb.setChecked(s.face_restore.enable)
         self.controlnet_cb.setChecked(s.controlnet.enable)
@@ -270,6 +280,11 @@ class MainWindow(QMainWindow):
         self.face_lock_cb.setChecked(s.temporal.face_lock_only)
         self.temporal_strength.setValue(s.temporal.strength)
         self.control_strength.setValue(s.controlnet.conditioning_scale)
+        self.long_video_cb.setChecked(s.long_video.enabled)
+        self.target_duration_spin.setValue(s.long_video.target_duration_sec)
+        self.chunk_frames_spin.setValue(s.long_video.chunk_frames)
+        self.overlap_frames_spin.setValue(s.long_video.overlap_frames)
+        self.target_fps_after_rife_spin.setValue(s.rife.target_fps)
         self._refresh_active_lora_widget()
         self.refresh_logs()
 
@@ -290,6 +305,7 @@ class MainWindow(QMainWindow):
         s.video.height = self.height_spin.value()
         s.video.fps = self.fps_spin.value()
         s.video.seed = self.seed_spin.value()
+        s.ip_adapter.scale = self.ip_adapter_scale.value()
         s.temporal.enable = self.temporal_cb.isChecked()
         s.temporal.face_lock_only = self.face_lock_cb.isChecked()
         s.temporal.strength = self.temporal_strength.value()
@@ -298,6 +314,11 @@ class MainWindow(QMainWindow):
         s.controlnet.conditioning_scale = self.control_strength.value()
         s.video.save_frames = self.save_frames_cb.isChecked()
         s.quality_preset = self.preset_box.currentText()
+        s.long_video.enabled = self.long_video_cb.isChecked()
+        s.long_video.target_duration_sec = self.target_duration_spin.value()
+        s.long_video.chunk_frames = self.chunk_frames_spin.value()
+        s.long_video.overlap_frames = self.overlap_frames_spin.value()
+        s.rife.target_fps = self.target_fps_after_rife_spin.value()
         return s
 
     def start_generation(self):
@@ -394,6 +415,9 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, stage: str, value: int):
         self.stage_label.setText(stage)
+        if stage.startswith("Chunk "):
+            # value is 0 for chunk transitions; let label do the work
+            return
         if stage == "Generating" and self.steps_spin.value() > 0:
             self.progress_bar.setValue(min(100, int((value / self.steps_spin.value()) * 100)))
         elif stage == "Done":
@@ -435,5 +459,5 @@ class MainWindow(QMainWindow):
         return item.data(Qt.UserRole) if item else None
 
     def _preset_changed(self, preset: str):
-        self.settings.apply_preset(preset)  # type: ignore[arg-type]
+        self.settings.apply_preset(preset)
         self._load_settings_into_ui()

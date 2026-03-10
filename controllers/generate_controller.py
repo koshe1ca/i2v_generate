@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QPixmap
 
-from models.history import HistoryItem
 from models.settings import AppSettings
 from services.history_service import HistoryService
 from services.pipeline_service import PipelineService
@@ -45,9 +42,12 @@ class GenerateWorker(QObject):
         tmp = Path(tempfile.gettempdir()) / "i2v_gui_previews"
         tmp.mkdir(parents=True, exist_ok=True)
         p1, p2, p3 = tmp / "first.png", tmp / "middle.png", tmp / "last.png"
-        first.save(p1)
-        middle.save(p2)
-        last.save(p3)
+        if first is not None:
+            first.save(p1)
+        if middle is not None:
+            middle.save(p2)
+        if last is not None:
+            last.save(p3)
         self.preview_ready.emit(str(p1), str(p2), str(p3))
 
 
@@ -93,10 +93,6 @@ class GenerateController(QObject):
     def cancel(self) -> None:
         if self.worker:
             self.worker.cancel()
-
-    def latest_history(self):
-        items = self.history.list_items()
-        return items[0] if items else None
 
     def _tick_monitor(self):
         self.monitor.emit(self.monitor_service.snapshot())
