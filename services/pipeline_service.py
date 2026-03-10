@@ -102,11 +102,12 @@ class PipelineService:
         if not hasattr(self.pipe, 'load_ip_adapter'):
             return
         try:
-            self.pipe.load_ip_adapter(
-                self.s.ip_adapter.model_id,
-                subfolder=self.s.ip_adapter.subfolder,
-                weight_name=self.s.ip_adapter.weight_name,
-            )
+            if self.s.ip_adapter_enabled:
+                self.pipe.load_ip_adapter(
+                    self.s.ip_adapter.model_id,
+                    subfolder=self.s.ip_adapter.subfolder,
+                    weight_name=self.s.ip_adapter.weight_name,
+                )
             if hasattr(self.pipe, 'set_ip_adapter_scale'):
                 self.pipe.set_ip_adapter_scale(float(self.s.ip_adapter.scale))
             self._ip_loaded = True
@@ -148,27 +149,28 @@ class PipelineService:
             stage_cb('Generating', int(step_idx) + 1)
         return kwargs
 
-    def _build_kwargs(self, control_images: Optional[List[Image.Image]], stage_cb: Optional[StageCallback]) -> dict:
-        kwargs = dict(
-            prompt=self.s.prompt,
-            negative_prompt=self.s.negative_prompt,
-            num_frames=self.s.video.num_frames,
-            num_inference_steps=self.s.video.steps,
-            guidance_scale=self.s.video.guidance,
-            width=self.s.video.width,
-            height=self.s.video.height,
-            generator=torch.Generator(device=self.s.device).manual_seed(int(self.s.video.seed)),
-            callback_on_step_end=lambda *args, **kw: self._callback_on_step_end(stage_cb, kw),
-        )
+    def _build_kwargs(self, control_images=None, stage_cb=None):
+        kwargs = {
+            "prompt": self.s.prompt,
+            "negative_prompt": self.s.negative_prompt,
+            "num_frames": self.s.ad_num_frames,
+            "num_inference_steps": self.s.ad_num_steps,
+            "guidance_scale": self.s.ad_guidance,
+            "width": self.s.ad_width,
+            "height": self.s.ad_height,
+            "generator": self._make_generator(),
+        }
+
+        if stage_cb is not None:
+            kwargs["callback_on_step_end"] = stage_cb
+            kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+
         if control_images is not None:
-            kwargs['control_image'] = control_images
-            kwargs['controlnet_conditioning_scale'] = float(self.s.controlnet.conditioning_scale)
-        identity_image = self._resolve_identity_image()
-        if identity_image is not None and self._ip_loaded:
-            if 'ip_adapter_image' in getattr(self.pipe, '__call__').__code__.co_varnames:
-                kwargs['ip_adapter_image'] = identity_image
-            else:
-                kwargs['image'] = identity_image
+            kwargs["image"] = control_images
+
+        if getattr(self, "_ip_adapter_image", None) is not None:
+            kwargs["ip_adapter_image"] = self._ip_adapter_image
+
         return kwargs
 
     def _apply_post(self, frames: List[Image.Image], stage_cb: Optional[StageCallback], preview_cb: Optional[PreviewCallback]) -> List[Image.Image]:
