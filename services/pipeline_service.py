@@ -139,13 +139,12 @@ class PipelineService:
             src.convert('RGB').save(dst)
         return str(first), str(middle), str(last)
 
-    def _callback_on_step_end(self, stage_cb: Optional[StageCallback], kwargs: dict):
+    def _callback_on_step_end(self, stage_cb: Optional[StageCallback], pipeline, step_index, timestep, callback_kwargs):
         if self._cancel.is_set():
-            raise RuntimeError('Generation cancelled by user')
-        step_idx = kwargs.get('step_index', kwargs.get('i', 0))
+            raise RuntimeError("Generation cancelled by user")
         if stage_cb:
-            stage_cb('Generating', int(step_idx) + 1)
-        return kwargs
+            stage_cb("Generating", int(step_index) + 1)
+        return callback_kwargs
 
     def _build_kwargs(self, control_images=None, stage_cb=None):
         kwargs = {
@@ -160,7 +159,10 @@ class PipelineService:
         }
 
         if stage_cb is not None:
-            kwargs["callback_on_step_end"] = stage_cb
+            kwargs["callback_on_step_end"] = (
+                lambda pipeline, step_index, timestep, callback_kwargs:
+                self._callback_on_step_end(stage_cb, pipeline, step_index, timestep, callback_kwargs)
+            )
             kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
 
         if control_images is not None:
