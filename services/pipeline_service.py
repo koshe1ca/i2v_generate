@@ -220,10 +220,13 @@ class PipelineService:
             if self.pipe is None:
                 raise RuntimeError('Pipeline not loaded')
             control_images, pose_dir = self._prepare_motion_control(stage_cb)
+            self._ip_adapter_image = self._resolve_identity_image()
+            if self.s.ip_adapter.enabled and self._ip_adapter_image is None:
+                raise RuntimeError("IP-Adapter включен, но не выбрано корректное Photo.")
             if stage_cb:
                 stage_cb('Generating', 0)
+
             out = self.pipe(**self._build_kwargs(control_images, stage_cb))
-            self._ip_adapter_image = self._resolve_identity_image()
             frames = out.frames[0]
             if self._cancel.is_set():
                 raise RuntimeError('Generation cancelled by user')
