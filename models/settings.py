@@ -28,6 +28,7 @@ class FaceRestoreSettings(BaseModel):
     enable: bool = True
     backend: Literal["auto", "codeformer", "gfpgan", "none"] = "auto"
     strength: float = 0.55
+    executable: Optional[str] = None
 
 
 class ControlNetSettings(BaseModel):

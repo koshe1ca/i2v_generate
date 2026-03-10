@@ -131,7 +131,7 @@ class FaceRestoreService:
             return [Image.open(p).convert('RGB') for p in restored[:len(frames)]]
 
     def _resolve_executable(self, names: List[str]) -> Optional[str]:
-        explicit = self.settings.executable
+        explicit = getattr(self.settings, "executable", None)
         if explicit and Path(explicit).exists():
             return explicit
         for key in ('CODEFORMER_EXE', 'GFPGAN_EXE'):
