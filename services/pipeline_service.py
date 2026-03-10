@@ -99,20 +99,18 @@ class PipelineService:
             return
         if not self.s.input_image and not self.s.ip_adapter.image_path:
             return
-        if not hasattr(self.pipe, 'load_ip_adapter'):
+        if not hasattr(self.pipe, "load_ip_adapter"):
             return
         try:
-            if self.s.ip_adapter_enabled:
-                self.pipe.load_ip_adapter(
-                    self.s.ip_adapter.model_id,
-                    subfolder=self.s.ip_adapter.subfolder,
-                    weight_name=self.s.ip_adapter.weight_name,
-                )
-            if hasattr(self.pipe, 'set_ip_adapter_scale'):
+            self.pipe.load_ip_adapter(
+                self.s.ip_adapter.model_id,
+                subfolder=self.s.ip_adapter.subfolder,
+                weight_name=self.s.ip_adapter.weight_name,
+            )
+            if hasattr(self.pipe, "set_ip_adapter_scale"):
                 self.pipe.set_ip_adapter_scale(float(self.s.ip_adapter.scale))
             self._ip_loaded = True
         except Exception:
-            # keep running without ip-adapter rather than fail hard
             self._ip_loaded = False
 
     def _load_pose_images(self, pose_dir: str) -> List[Image.Image]:
@@ -153,11 +151,11 @@ class PipelineService:
         kwargs = {
             "prompt": self.s.prompt,
             "negative_prompt": self.s.negative_prompt,
-            "num_frames": self.s.ad_num_frames,
-            "num_inference_steps": self.s.ad_num_steps,
-            "guidance_scale": self.s.ad_guidance,
-            "width": self.s.ad_width,
-            "height": self.s.ad_height,
+            "num_frames": self.s.video.num_frames,
+            "num_inference_steps": self.s.video.steps,
+            "guidance_scale": self.s.video.guidance,
+            "width": self.s.video.width,
+            "height": self.s.video.height,
             "generator": self._make_generator(),
         }
 
@@ -196,6 +194,11 @@ class PipelineService:
             preview_cb(frames[0], frames[len(frames) // 2], frames[-1])
         return frames
 
+    def _make_generator(self):
+        g = torch.Generator(device=self.s.device if self.s.device != "auto" else "cuda")
+        g.manual_seed(int(self.s.video.seed))
+        return g
+
     def _prepare_motion_control(self, stage_cb: Optional[StageCallback]) -> tuple[Optional[List[Image.Image]], Optional[str]]:
         if self.s.mode != 'photo_plus_video_motion':
             return None, None
@@ -220,6 +223,7 @@ class PipelineService:
             if stage_cb:
                 stage_cb('Generating', 0)
             out = self.pipe(**self._build_kwargs(control_images, stage_cb))
+            self._ip_adapter_image = self._resolve_identity_image()
             frames = out.frames[0]
             if self._cancel.is_set():
                 raise RuntimeError('Generation cancelled by user')
