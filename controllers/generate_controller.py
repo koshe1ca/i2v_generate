@@ -38,16 +38,12 @@ class GenerateWorker(QObject):
     def _preview(self, first, middle, last):
         import tempfile
         from pathlib import Path
-
         tmp = Path(tempfile.gettempdir()) / "i2v_gui_previews"
         tmp.mkdir(parents=True, exist_ok=True)
         p1, p2, p3 = tmp / "first.png", tmp / "middle.png", tmp / "last.png"
-        if first is not None:
-            first.save(p1)
-        if middle is not None:
-            middle.save(p2)
-        if last is not None:
-            last.save(p3)
+        first.save(p1)
+        middle.save(p2)
+        last.save(p3)
         self.preview_ready.emit(str(p1), str(p2), str(p3))
 
 

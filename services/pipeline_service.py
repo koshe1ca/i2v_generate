@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import math
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import torch
 from PIL import Image
@@ -15,6 +14,7 @@ from models.settings import AppSettings
 from services.error_log_service import ErrorLogService
 from services.face_restore_service import FaceRestoreService
 from services.history_service import HistoryService
+from services.photo_preserve_service import PhotoPreserveService
 from services.pose_service import PoseService
 from services.temporal_service import TemporalService
 from services.video_service import VideoService
@@ -31,12 +31,13 @@ class PipelineService:
         self.temporal = TemporalService()
         self.face_restore = FaceRestoreService(self.s.face_restore)
         self.pose_service = PoseService() if self.s.controlnet.enable else None
+        self.photo_preserve = PhotoPreserveService(self.s)
         self.history = HistoryService(str(self.s.effective_output_dir()))
         self.errors = ErrorLogService(str(self.s.effective_output_dir()))
         self._cancel = threading.Event()
         self._loaded_lora_paths: set[str] = set()
         self._ip_loaded = False
-        self._ip_adapter_image: Optional[Image.Image] = None
+        self._ip_adapter_image = None
         self.s.refresh_duration()
         self.s.effective_output_dir().mkdir(parents=True, exist_ok=True)
 
@@ -46,19 +47,20 @@ class PipelineService:
     def reset_cancel(self) -> None:
         self._cancel.clear()
 
-    def _check_cancel(self) -> None:
-        if self._cancel.is_set():
-            raise RuntimeError("Generation cancelled by user")
+    def _make_generator(self):
+        device = self.s.device if self.s.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        g = torch.Generator(device=device)
+        g.manual_seed(int(self.s.video.seed))
+        return g
 
     def load(self) -> None:
-        if self.pipe is not None:
+        if self.pipe is not None or self.s.photo_preserve.enabled:
             return
         dtype = torch.float16 if self.s.torch_dtype in {"auto", "float16"} else torch.float32
         adapter = MotionAdapter.from_pretrained(self.s.motion_adapter, torch_dtype=dtype)
         controlnet = None
         if self.s.controlnet.enable:
             controlnet = ControlNetModel.from_pretrained(self.s.controlnet.model_id, torch_dtype=dtype)
-
         self.pipe = AnimateDiffPipeline.from_pretrained(
             self.s.base_model,
             motion_adapter=adapter,
@@ -115,10 +117,6 @@ class PipelineService:
         except Exception:
             self._ip_loaded = False
 
-    def _load_pose_images(self, pose_dir: str) -> List[Image.Image]:
-        p = Path(pose_dir)
-        return [Image.open(x).convert("RGB") for x in sorted(p.glob("*.png"))]
-
     def _resolve_identity_image(self) -> Optional[Image.Image]:
         path = self.s.ip_adapter.image_path or self.s.input_image
         if not path:
@@ -128,27 +126,25 @@ class PipelineService:
             return None
         return Image.open(p).convert("RGB")
 
-    def _make_previews(self, frames: List[Image.Image], item_id: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        if not frames:
-            return None, None, None
-        preview_dir = self.s.effective_output_dir() / "previews" / item_id
-        preview_dir.mkdir(parents=True, exist_ok=True)
-        first = preview_dir / "first.png"
-        middle = preview_dir / "middle.png"
-        last = preview_dir / "last.png"
-        picks = [frames[0], frames[len(frames) // 2], frames[-1]]
-        for src, dst in zip(picks, [first, middle, last]):
-            src.convert("RGB").save(dst)
-        return str(first), str(middle), str(last)
+    def _load_pose_images(self, pose_dir: str) -> List[Image.Image]:
+        p = Path(pose_dir)
+        return [Image.open(x).convert("RGB") for x in sorted(p.glob("*.png"))]
 
-    def _make_generator(self):
-        device = self.s.device if self.s.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-        g = torch.Generator(device=device)
-        g.manual_seed(int(self.s.video.seed))
-        return g
+    def _prepare_motion_control(self, stage_cb: Optional[StageCallback]) -> tuple[Optional[List[Image.Image]], Optional[str]]:
+        if self.s.mode != "photo_plus_video_motion" or not self.s.controlnet.enable:
+            return None, None
+        if not self.s.ref_video:
+            raise RuntimeError("Reference video is required for motion-transfer mode")
+        if stage_cb:
+            stage_cb("Extracting pose", 0)
+        pose_dir = str((self.s.effective_output_dir() / "pose_cache" / f"pose_{int(time.time())}").resolve())
+        self.pose_service = self.pose_service or PoseService()
+        self.pose_service.extract_pose_frames(self.s.ref_video, pose_dir)
+        return self._load_pose_images(pose_dir), pose_dir
 
     def _callback_on_step_end(self, stage_cb: Optional[StageCallback], pipeline, step_index, timestep, callback_kwargs):
-        self._check_cancel()
+        if self._cancel.is_set():
+            raise RuntimeError("Generation cancelled by user")
         if stage_cb:
             stage_cb("Generating", int(step_index) + 1)
         return callback_kwargs
@@ -164,20 +160,17 @@ class PipelineService:
             "height": self.s.video.height,
             "generator": self._make_generator(),
         }
-
         if stage_cb is not None:
             kwargs["callback_on_step_end"] = (
-                lambda pipeline, step_index, timestep, callback_kwargs:
-                self._callback_on_step_end(stage_cb, pipeline, step_index, timestep, callback_kwargs)
+                lambda pipeline, step_index, timestep, callback_kwargs: self._callback_on_step_end(
+                    stage_cb, pipeline, step_index, timestep, callback_kwargs
+                )
             )
             kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
-
         if control_images is not None:
             kwargs["image"] = control_images
-
-        if self._ip_loaded and getattr(self, "_ip_adapter_image", None) is not None:
+        if getattr(self, "_ip_adapter_image", None) is not None:
             kwargs["ip_adapter_image"] = self._ip_adapter_image
-
         return kwargs
 
     def _apply_post(self, frames: List[Image.Image], stage_cb: Optional[StageCallback], preview_cb: Optional[PreviewCallback]) -> List[Image.Image]:
@@ -188,7 +181,6 @@ class PipelineService:
                 frames = self.temporal.apply_face_lock(frames, strength=self.s.temporal.strength)
             else:
                 frames = self.temporal.apply_global_temporal(frames, strength=self.s.temporal.strength)
-
         if self.s.face_restore.enable:
             if stage_cb:
                 stage_cb("Face restore", 0)
@@ -198,103 +190,73 @@ class PipelineService:
                 method=self.s.face_restore.backend if self.s.face_restore.backend != "auto" else "codeformer",
                 strength=self.s.face_restore.strength,
             )
-
         if preview_cb and frames:
             preview_cb(frames[0], frames[len(frames) // 2], frames[-1])
         return frames
 
-    def _prepare_motion_control(self, stage_cb: Optional[StageCallback]) -> tuple[Optional[List[Image.Image]], Optional[str]]:
-        if self.s.mode != "photo_plus_video_motion":
-            return None, None
-        if not self.s.ref_video:
-            raise RuntimeError("Reference video is required for motion-transfer mode")
+    def _make_previews(self, frames: List[Image.Image], item_id: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        if not frames:
+            return None, None, None
+        preview_dir = self.s.effective_output_dir() / "previews" / item_id
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        first = preview_dir / "first.png"
+        middle = preview_dir / "middle.png"
+        last = preview_dir / "last.png"
+        picks = [frames[0], frames[len(frames) // 2], frames[-1]]
+        for src, dst in zip(picks, [first, middle, last]):
+            src.convert("RGB").save(dst)
+        return str(first), str(middle), str(last)
+
+    def _generate_preserve_long(self, stage_cb: Optional[StageCallback], preview_cb: Optional[PreviewCallback]) -> List[Image.Image]:
         if stage_cb:
-            stage_cb("Extracting pose", 0)
-        pose_dir = str((self.s.effective_output_dir() / "pose_cache" / f"pose_{int(time.time())}").resolve())
-        self.pose_service = self.pose_service or PoseService()
-        self.pose_service.extract_pose_frames(self.s.ref_video, pose_dir)
-        return self._load_pose_images(pose_dir), pose_dir
-
-    def _generate_single_chunk(self, control_images, stage_cb) -> List[Image.Image]:
-        self._check_cancel()
-        out = self.pipe(**self._build_kwargs(control_images, stage_cb))
-        return out.frames[0]
-
-    def _compute_long_video_plan(self) -> Tuple[int, int, int]:
-        fps = max(1, int(self.s.video.fps))
-        target_total_frames = max(1, int(round(self.s.long_video.target_duration_sec * fps)))
-        chunk_frames = max(4, int(self.s.long_video.chunk_frames))
-        overlap = max(0, min(int(self.s.long_video.overlap_frames), chunk_frames - 1))
-        return target_total_frames, chunk_frames, overlap
-
-    def _generate_long_photo_prompt(self, stage_cb: Optional[StageCallback], preview_cb: Optional[PreviewCallback]) -> List[Image.Image]:
-        target_total_frames, chunk_frames, overlap = self._compute_long_video_plan()
-        effective_per_chunk = max(1, chunk_frames - overlap)
-        chunk_count = max(1, math.ceil(max(1, target_total_frames - overlap) / effective_per_chunk))
-        final_frames: List[Image.Image] = []
-        original_num_frames = self.s.video.num_frames
-        try:
-            for chunk_idx in range(chunk_count):
-                self._check_cancel()
-                self.s.video.num_frames = chunk_frames
-                if stage_cb:
-                    stage_cb(f"Chunk {chunk_idx + 1}/{chunk_count}", 0)
-                chunk_frames_list = self._generate_single_chunk(None, stage_cb)
-                if preview_cb and chunk_frames_list:
-                    preview_cb(chunk_frames_list[0], chunk_frames_list[len(chunk_frames_list) // 2], chunk_frames_list[-1])
-                if not final_frames:
-                    final_frames = chunk_frames_list
-                else:
-                    final_frames = self.video.blend_frame_lists(final_frames, chunk_frames_list, overlap)
-                if self.s.long_video.export_intermediate_chunks:
-                    self.video.save_frames(chunk_frames_list, tag=f"chunk_{chunk_idx:03d}")
-                if len(final_frames) >= target_total_frames:
-                    final_frames = final_frames[:target_total_frames]
-                    break
-            return final_frames[:target_total_frames]
-        finally:
-            self.s.video.num_frames = original_num_frames
+            stage_cb("Photo-preserve animation", 0)
+        frames = self.photo_preserve.generate(stage_cb=stage_cb)
+        if self.s.long_video.enabled and len(frames) > self.s.long_video.chunk_frames:
+            frames = self.video.chunk_blend_sequence(
+                frames,
+                chunk_size=self.s.long_video.chunk_frames,
+                overlap=self.s.long_video.overlap_frames,
+                blend=self.s.long_video.stitch_blend,
+            )
+        if preview_cb and frames:
+            preview_cb(frames[0], frames[len(frames) // 2], frames[-1])
+        return frames
 
     def generate(self, stage_cb: Optional[StageCallback] = None, preview_cb: Optional[PreviewCallback] = None) -> Path:
         self.reset_cancel()
         try:
             if stage_cb:
                 stage_cb("Loading models", 0)
-            self.load()
-            if self.pipe is None:
-                raise RuntimeError("Pipeline not loaded")
-
-            control_images, _pose_dir = self._prepare_motion_control(stage_cb)
-            self._ip_adapter_image = self._resolve_identity_image()
-            if self.s.ip_adapter.enabled and self._ip_loaded and self._ip_adapter_image is None:
-                raise RuntimeError("IP-Adapter enabled but no valid Photo selected.")
-
-            if stage_cb:
-                stage_cb("Generating", 0)
-
-            if self.s.long_video.enabled and self.s.mode == "photo_prompt":
-                frames = self._generate_long_photo_prompt(stage_cb, preview_cb)
+            frames: List[Image.Image]
+            if self.s.photo_preserve.enabled:
+                frames = self._generate_preserve_long(stage_cb, preview_cb)
             else:
-                frames = self._generate_single_chunk(control_images, stage_cb)
-
-            self._check_cancel()
+                self.load()
+                if self.pipe is None:
+                    raise RuntimeError("Pipeline not loaded")
+                control_images, _ = self._prepare_motion_control(stage_cb)
+                self._ip_adapter_image = self._resolve_identity_image()
+                if self.s.ip_adapter.enabled and self._ip_adapter_image is None:
+                    raise RuntimeError("IP-Adapter enabled, but no valid Photo selected.")
+                if stage_cb:
+                    stage_cb("Generating", 0)
+                out = self.pipe(**self._build_kwargs(control_images, stage_cb))
+                frames = out.frames[0]
+            if self._cancel.is_set():
+                raise RuntimeError("Generation cancelled by user")
             frames = self._apply_post(frames, stage_cb, preview_cb)
-
             frames_dir = None
             if self.s.video.save_frames:
                 if stage_cb:
                     stage_cb("Saving frames", 0)
                 frames_dir = self.video.save_frames(frames, tag=self.s.mode)
-
             if stage_cb:
                 stage_cb("Encoding MP4", 0)
             mp4 = self.video.export_mp4(frames, fps=self.s.video.fps, tag=self.s.mode)
-
             if self.s.rife.enable:
                 if stage_cb:
                     stage_cb("RIFE interpolation", 0)
                 mp4 = self.video.maybe_interpolate_with_rife(mp4, tag=self.s.mode)
-
             item_id = self.history.new_id()
             p1, p2, p3 = self._make_previews(frames, item_id)
             item = HistoryItem(

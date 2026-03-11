@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 class VideoSettings(BaseModel):
     num_frames: int = 24
     steps: int = 30
-    guidance: float = 6.5
+    guidance: float = 6.0
     width: int = 512
     height: int = 768
     fps: int = 12
@@ -21,13 +21,13 @@ class VideoSettings(BaseModel):
 class TemporalSettings(BaseModel):
     enable: bool = True
     face_lock_only: bool = True
-    strength: float = 0.75
+    strength: float = 0.7
 
 
 class FaceRestoreSettings(BaseModel):
-    enable: bool = True
+    enable: bool = False
     backend: Literal["auto", "codeformer", "gfpgan", "none"] = "auto"
-    strength: float = 0.55
+    strength: float = 0.5
     executable: Optional[str] = None
 
 
@@ -38,13 +38,13 @@ class ControlNetSettings(BaseModel):
 
 
 class RifeSettings(BaseModel):
-    enable: bool = True
+    enable: bool = False
     target_fps: int = 24
     cli_path: Optional[str] = None
 
 
 class IPAdapterSettings(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     model_id: str = "h94/IP-Adapter"
     subfolder: str = "models"
     weight_name: str = "ip-adapter_sd15.bin"
@@ -73,6 +73,23 @@ class LongVideoSettings(BaseModel):
     export_intermediate_chunks: bool = False
 
 
+class PhotoPreserveSettings(BaseModel):
+    enabled: bool = True
+    keep_background: bool = True
+    keep_subject_colors: bool = True
+    preserve_strength: float = 0.95
+    face_region_scale: float = 1.2
+    body_region_scale: float = 1.0
+    background_blur_radius: int = 0
+    motion_mode: Literal["prompt_reenactment", "ref_video_reenactment"] = "prompt_reenactment"
+    motion_strength: float = 0.4
+    warp_strength: float = 0.65
+    mouth_open_amount: float = 0.15
+    blink_amount: float = 0.08
+    sway_amount: float = 0.04
+    breathing_amount: float = 0.03
+
+
 class AppSettings(BaseModel):
     mode: Literal["photo_prompt", "photo_plus_video_motion"] = "photo_prompt"
     quality_preset: Literal["fast", "balanced", "high"] = "balanced"
@@ -80,8 +97,8 @@ class AppSettings(BaseModel):
     base_model: str = "SG161222/Realistic_Vision_V5.1_noVAE"
     motion_adapter: str = "guoyww/animatediff-motion-adapter-v1-5"
 
-    prompt: str = "masterpiece, realistic human, subtle head motion, smartphone portrait video"
-    negative_prompt: str = "blurry, deformed, artifacts, flicker, ghosting, duplicate face"
+    prompt: str = "subtle natural motion, blinking, slight head sway"
+    negative_prompt: str = "deformed, duplicate face, ghosting, flicker"
 
     input_image: Optional[str] = None
     ref_video: Optional[str] = None
@@ -98,9 +115,9 @@ class AppSettings(BaseModel):
     ip_adapter: IPAdapterSettings = Field(default_factory=IPAdapterSettings)
     lora: LoraSettings = Field(default_factory=LoraSettings)
     long_video: LongVideoSettings = Field(default_factory=LongVideoSettings)
+    photo_preserve: PhotoPreserveSettings = Field(default_factory=PhotoPreserveSettings)
 
     def refresh_duration(self) -> None:
-        # keep target duration in sync with direct frame/fps edits when long mode is off
         if not self.long_video.enabled and self.video.fps > 0:
             self.long_video.target_duration_sec = max(1.0, self.video.num_frames / float(self.video.fps))
 
@@ -111,53 +128,40 @@ class AppSettings(BaseModel):
         preset = preset.lower().strip()
         self.quality_preset = preset  # type: ignore[assignment]
         if preset == "fast":
-            self.video.num_frames = 16
-            self.video.steps = 24
-            self.video.guidance = 6.0
+            self.video.num_frames = 12
+            self.video.steps = 20
+            self.video.guidance = 5.5
             self.video.width = 512
             self.video.height = 768
             self.video.fps = 12
-            self.temporal.enable = True
-            self.temporal.face_lock_only = True
-            self.temporal.strength = 0.70
-            self.face_restore.enable = True
-            self.face_restore.strength = 0.45
             self.rife.enable = False
-            self.rife.target_fps = 12
-            self.ip_adapter.scale = 0.55
+            self.temporal.strength = 0.6
+            self.photo_preserve.motion_strength = 0.28
             self.long_video.chunk_frames = 12
             self.long_video.overlap_frames = 3
         elif preset == "high":
             self.video.num_frames = 20
-            self.video.steps = 34
-            self.video.guidance = 6.8
+            self.video.steps = 32
+            self.video.guidance = 6.2
             self.video.width = 576
             self.video.height = 1024
             self.video.fps = 12
-            self.temporal.enable = True
-            self.temporal.face_lock_only = True
-            self.temporal.strength = 0.80
-            self.face_restore.enable = True
-            self.face_restore.strength = 0.60
             self.rife.enable = True
             self.rife.target_fps = 24
-            self.ip_adapter.scale = 0.65
+            self.temporal.strength = 0.8
+            self.photo_preserve.motion_strength = 0.5
             self.long_video.chunk_frames = 20
             self.long_video.overlap_frames = 5
-        else:  # balanced
+        else:
             self.video.num_frames = 16
-            self.video.steps = 30
-            self.video.guidance = 6.5
+            self.video.steps = 28
+            self.video.guidance = 6.0
             self.video.width = 512
             self.video.height = 768
             self.video.fps = 12
-            self.temporal.enable = True
-            self.temporal.face_lock_only = True
-            self.temporal.strength = 0.75
-            self.face_restore.enable = True
-            self.face_restore.strength = 0.55
             self.rife.enable = True
             self.rife.target_fps = 24
-            self.ip_adapter.scale = 0.60
+            self.temporal.strength = 0.7
+            self.photo_preserve.motion_strength = 0.4
             self.long_video.chunk_frames = 16
             self.long_video.overlap_frames = 4
